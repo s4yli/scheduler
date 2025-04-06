@@ -79,8 +79,8 @@ func initStream() error {
 	return nil
 }
 
-// fetchResources récupère les ressources depuis Config et retourne les IDs
-func fetchResources() ([]int, error) {
+// fetchResources récupère les ressources depuis Config
+func fetchResources() ([]Resource, error) {
 	fmt.Println("Récupération des ressources depuis l'API Config...")
 	resp, err := http.Get(configAPI)
 	if err != nil {
@@ -94,25 +94,14 @@ func fetchResources() ([]int, error) {
 		return nil, err
 	}
 
-	// Extraire seulement les UcaID
-	var ucaIDs []int
-	for _, res := range resources {
-		ucaIDs = append(ucaIDs, res.UcaID)
-	}
-	fmt.Printf("Ressources récupérées: %+v\n", ucaIDs)
-	return ucaIDs, nil
+	fmt.Printf("Ressources récupérées: %+v\n", resources)
+	return resources, nil
 }
 
-// buildEdtURL génère l'URL pour récupérer les événements
-func buildEdtURL(ucaIDs []int) string {
-	idStrs := make([]string, len(ucaIDs))
-	for i, id := range ucaIDs {
-		idStrs[i] = fmt.Sprintf("%d", id)
-	}
-	resourceParam := strings.Join(idStrs, ",")
-
-	url := fmt.Sprintf("https://edt.uca.fr/jsp/custom/modules/plannings/anonymous_cal.jsp?resources=%s&projectId=2&calType=ical&nbWeeks=8&displayConfigId=128", resourceParam)
-	fmt.Printf("URL générée pour récupérer les événements: %s\n", url)
+// buildEdtURL génère l'URL pour récupérer les événements pour une ressource donnée
+func buildEdtURL(resourceUcaID int) string {
+	url := fmt.Sprintf("https://edt.uca.fr/jsp/custom/modules/plannings/anonymous_cal.jsp?resources=%d&projectId=2&calType=ical&nbWeeks=8&displayConfigId=128", resourceUcaID)
+	fmt.Printf("URL générée pour la ressource %d: %s\n", resourceUcaID, url)
 	return url
 }
 
@@ -132,17 +121,15 @@ func fetchICalendar(url string) (string, error) {
 	}
 	defer file.Close()
 
-	// Copier la réponse dans le fichier .ics
 	_, err = io.Copy(file, resp.Body)
 	if err != nil {
 		return "", err
 	}
 
-	// Retourner le nom du fichier pour l'analyse
 	return "events.ics", nil
 }
 
-// parseICalendar extrait les événements depuis un fichier .ics
+// parseICalendarFromFile extrait les événements depuis un fichier .ics
 func parseICalendarFromFile(filePath string) ([]Event, error) {
 	fmt.Println("Analyse du fichier iCalendar:", filePath)
 
@@ -248,21 +235,11 @@ func parseICalendarFromFile(filePath string) ([]Event, error) {
 	return events, nil
 }
 
-// extractField extrait un champ spécifique depuis le texte d'un événement
-func extractField(eventData string, pattern string) string {
-	re := regexp.MustCompile("(?s)" + pattern) // Mode single-line
-	match := re.FindStringSubmatch(eventData)
-	if len(match) > 1 {
-		return strings.ReplaceAll(strings.TrimSpace(match[1]), "\n ", "") // Supprime les sauts de ligne continus
-	}
-	return ""
-}
-
 // publishEvents envoie les événements via JetStream
 func publishEvents(events []Event) error {
 	fmt.Println("Publication des événements dans JetStream...")
 	for _, event := range events {
-		fmt.Printf("📌 Avant la sérialisation : %+v\n", event) // Debug avant JSON
+		fmt.Printf("📌 Avant la sérialisation : %+v\n", event)
 		eventJSON, err := json.Marshal(event)
 		if err != nil {
 			fmt.Println("Erreur de sérialisation JSON:", err)
@@ -270,15 +247,12 @@ func publishEvents(events []Event) error {
 		}
 
 		fmt.Printf("Envoi de l'événement : %s\n", string(eventJSON))
-
-		// Publier asynchrone dans JetStream
 		pubAckFuture, err := jsc.PublishAsync(subject, eventJSON)
 		if err != nil {
 			fmt.Println("Erreur d'envoi à JetStream:", err)
 			continue
 		}
 
-		// Vérifier si l'ACK est reçu
 		select {
 		case ack := <-pubAckFuture.Ok():
 			fmt.Println("Événement publié avec succès:", ack.Stream, ack.Sequence)
@@ -289,7 +263,7 @@ func publishEvents(events []Event) error {
 	return nil
 }
 
-// fetchAndPublishEvents récupère et publie les événements
+// fetchAndPublishEvents récupère et publie les événements pour chaque ressource
 func fetchAndPublishEvents(ctx context.Context) {
 	fmt.Println("Exécution de la tâche programmée...")
 
@@ -299,31 +273,45 @@ func fetchAndPublishEvents(ctx context.Context) {
 		return
 	}
 
-	edtURL := buildEdtURL(resources)
-	filePath, err := fetchICalendar(edtURL)
-	if err != nil {
-		fmt.Println("Erreur lors de la récupération du fichier iCalendar:", err)
-		return
-	}
+	// Pour chaque ressource, récupérer et publier les événements individuellement
+	for _, resource := range resources {
+		edtURL := buildEdtURL(resource.UcaId)
+		filePath, err := fetchICalendar(edtURL)
+		if err != nil {
+			fmt.Printf("Erreur lors de la récupération du fichier iCalendar pour la ressource %d: %v\n", resource.UcaId, err)
+			continue
+		}
 
-	// Analyser le fichier .ics
-	events, err := parseICalendarFromFile(filePath)
-	if err != nil {
-		fmt.Println("Erreur lors de l'analyse du fichier iCalendar:", err)
-		return
-	}
+		// Analyse du fichier ICS
+		events, err := parseICalendarFromFile(filePath)
+		if err != nil {
+			fmt.Printf("Erreur lors de l'analyse du fichier iCalendar pour la ressource %d: %v\n", resource.UcaId, err)
+			continue
+		}
 
-	err = publishEvents(events)
-	if err != nil {
-		fmt.Println("Erreur lors de l'envoi des événements à JetStream:", err)
+		// Ajouter l'id de la ressource à chaque événement
+		for i := range events {
+			events[i].ResourceID = resource.Id
+		}
+
+		// Publication des événements pour cette ressource
+		err = publishEvents(events)
+		if err != nil {
+			fmt.Printf("Erreur lors de l'envoi des événements à JetStream pour la ressource %d: %v\n", resource.UcaId, err)
+		}
 	}
 }
 
 // Structures pour les ressources et événements
+
+// Nouvelle structure Resource incluant l'id (UUID sous forme de chaîne)
 type Resource struct {
-	UcaID int `json:"uca_id"`
+	Id    string `json:"id"`
+	UcaId int    `json:"uca_id"`
+	Name  string `json:"name"`
 }
 
+// Structure Event modifiée pour inclure le champ ResourceID
 type Event struct {
 	Id           string `json:"UID"`
 	Dtstamp      string `json:"DTSTAMP"`
@@ -333,4 +321,5 @@ type Event struct {
 	Location     string `json:"LOCATION"`
 	Created      string `json:"CREATED"`
 	LastModified string `json:"LAST-MODIFIED"`
+	ResourceID   string `json:"resource_id"`
 }
